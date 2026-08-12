@@ -34,6 +34,12 @@ cmd/server/main.go
             -> PingContext on PostgreSQL
             -> 200 JSON response, or HTTP 503 when unavailable
 
+cmd/migrate/main.go
+  -> internal/config/config.go
+       reads DATABASE_URL
+  -> internal/database/postgres/migrator.go
+       reads ordered SQL files, locks PostgreSQL, and applies missing files
+
 Future write path:
 HTTP request -> domain validation -> SQL transaction -> COMMIT
                                        -> PostgreSQL verifies balance
@@ -44,8 +50,10 @@ HTTP request -> domain validation -> SQL transaction -> COMMIT
 | go.mod | Module name and direct dependency on pgx. |
 | go.sum | Download checksums maintained by Go. |
 | cmd/server/main.go | Runnable server and health route. |
+| cmd/migrate/main.go | Runnable schema-migration command; it accepts `up`. |
 | internal/config/config.go | Reads configuration from environment variables. |
 | internal/database/postgres/store.go | Database-pool and transaction helper. |
+| internal/database/postgres/migrator.go | Finds, locks, applies, and records schema migrations. |
 | internal/domain/types.go | Ledger types and early Go validation. |
 | internal/domain/errors.go | Named errors used by validation/tests. |
 | migrations/000001_create_ledger.sql | Tables, constraints, indexes, and triggers. |
@@ -333,6 +341,179 @@ actually commits/rolls back atomically and enforces deferred constraints.
 The line _ = tx.Rollback() intentionally ignores a possible rollback error,
 because the callback's original SQL error is normally the useful one.
 
+## Schema migrations: changing the database safely over time
+
+A **schema migration** is a versioned SQL file that changes the structure of a
+database: creating a table, adding a column, adding an index, and so on.
+
+Phase 1 has one file:
+
+~~~text
+migrations/000001_create_ledger.sql
+~~~
+
+Later phases deliberately add files such as `000002_create_owners.sql` and
+`000003_reservation_settlement.sql`. Once a migration has been applied to a
+database, do not edit that file. Create a new migration instead. This preserves
+a clear, reproducible history of how an older database reaches the current
+schema.
+
+### Why this project uses a Go migration command
+
+For one brand-new local database, this direct command is simpler:
+
+~~~bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/000001_create_ledger.sql
+~~~
+
+However, it only executes one file. It does not remember that the file ran, so
+running it again usually fails because tables already exist. It also does not
+choose and run later files in order.
+
+TokenLedger is planned to have several forward-only migrations plus other Go
+operational commands (`cmd/reconcile` and `cmd/import`). Therefore it uses one
+small Go command instead:
+
+~~~bash
+go run ./cmd/migrate up
+~~~
+
+This is not because Go makes SQL safer by itself. PostgreSQL still executes and
+protects the SQL. The Go command provides a consistent, repeatable policy around
+the SQL: discover files, decide which have already run, serialize concurrent
+operators, and record successful work.
+
+### End-to-end command flow
+
+~~~text
+DATABASE_URL
+  -> cmd/migrate validates the single "up" argument
+  -> config.Load reads DATABASE_URL
+  -> postgres.Open creates a pool and verifies PostgreSQL is reachable
+  -> LoadMigrations reads migrations/*.sql and sorts filenames
+  -> ApplyMigrations uses one PostgreSQL connection
+       -> acquire advisory lock
+       -> create/check schema_migrations
+       -> for every unapplied file:
+            BEGIN
+              execute that SQL file
+              record its filename
+            COMMIT
+       -> release advisory lock
+~~~
+
+`cmd/migrate/main.go` is deliberately small. It rejects anything except `up`,
+loads configuration, loads the migration files, opens the database, and calls
+`ApplyMigrations`. The server never calls this command or migration package by
+itself: applying schema changes is an explicit operator step before server
+startup.
+
+### Migration filenames and ordering
+
+`LoadMigrations` reads regular files ending in `.sql`, then sorts their names
+lexicographically (dictionary order):
+
+~~~text
+000001_create_ledger.sql
+000002_create_owners.sql
+000003_reservation_settlement.sql
+~~~
+
+The zero-padded numeric prefix is important. It makes filename order equal the
+intended schema-change order. A non-SQL file is ignored; an empty migration
+directory is an error rather than a silently successful no-op.
+
+Each filename becomes a migration version. The command stores versions in this
+PostgreSQL table:
+
+~~~sql
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+~~~
+
+After the current file succeeds, a row conceptually looks like this:
+
+~~~text
+version                         applied_at
+000001_create_ledger.sql        2026-08-12 10:30:00+00
+~~~
+
+On the next run, the command asks PostgreSQL whether each filename is already
+present. A present filename is skipped. That makes `go run ./cmd/migrate up`
+**idempotent**: it is safe to run repeatedly and converges on the same schema.
+
+### Why the advisory lock matters
+
+Two terminals, CI jobs, or deployment processes could try to migrate the same
+database at the same time. Without coordination, both could observe that a file
+is absent and both could try to apply it.
+
+The migrator first asks PostgreSQL for an advisory lock. The first command gets
+it; another command against the same database waits. Once the first finishes,
+the waiting command obtains the lock, rechecks `schema_migrations`, sees the
+recorded filename, and skips it.
+
+~~~text
+Terminal A                         Terminal B
+----------                         ----------
+gets lock
+applies 000001
+records 000001
+releases lock                      gets lock
+                                  sees 000001 recorded
+                                  skips it
+                                  releases lock
+~~~
+
+PostgreSQL advisory locks belong to one physical connection. That is why
+`ApplyMigrations` gets a dedicated `*sql.Conn` from the pool and retains it from
+`pg_advisory_lock` through `pg_advisory_unlock`. A plain `*sql.DB` represents a
+pool and may use different connections for different calls, which would make a
+session-level lock unreliable.
+
+### One transaction per migration
+
+For each missing file, the migrator performs:
+
+~~~text
+BEGIN
+  execute migration SQL
+  INSERT INTO schema_migrations(version) VALUES ('000001_create_ledger.sql')
+COMMIT
+~~~
+
+The migration record is in the same transaction as the SQL. Therefore these two
+outcomes cannot be separated:
+
+~~~text
+SQL succeeds and COMMIT succeeds -> schema changes and migration record both exist
+SQL fails or COMMIT fails         -> PostgreSQL rolls back both
+~~~
+
+If `000002` fails after `000001` previously succeeded, `000001` remains safely
+recorded. Fix `000002` and rerun the command; it skips `000001` and retries only
+the missing file. This is why the runner uses one transaction *per file*, not
+one transaction for the entire migration history.
+
+### How migrations are tested
+
+The opt-in PostgreSQL integration test now exercises the real migration code:
+
+1. It drops the disposable test schema, including `schema_migrations`.
+2. It loads and applies migrations once.
+3. It runs the migrator a second time to prove rerunning works.
+4. It verifies that `schema_migrations` has one row per discovered SQL file.
+
+It only runs with a disposable database because it drops tables:
+
+~~~bash
+TOKEN_LEDGER_TEST_DATABASE_URL="$DATABASE_URL" go test ./tests/integration/...
+~~~
+
+Never point that variable at a database containing data you need to keep.
+
 ## Ledger database model
 
 The migration creates three tables:
@@ -598,13 +779,15 @@ Then, in another terminal:
 ~~~bash
 cd /Users/smavani/dev/token-ledger
 export DATABASE_URL='postgres://postgres:postgres@localhost:5432/tokenledger?sslmode=disable'
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/000001_create_ledger.sql
+go run ./cmd/migrate up
 go run ./cmd/server
 curl http://localhost:8080/healthz
 ~~~
 
-psql -1 applies the migration in one database transaction. If a statement
-fails, PostgreSQL rolls back the complete migration.
+Run `go run ./cmd/migrate up` before every server startup. It is safe to rerun:
+already-recorded migration files are skipped. The server does not automatically
+apply migrations, so a successful `/healthz` response still proves only that
+PostgreSQL is reachable.
 
 ## Core takeaways
 
@@ -615,4 +798,6 @@ Health checks prove connectivity, not ledger writes.
 Headers describe events; entries record debit/credit lines.
 Headers and entries are append-only.
 PostgreSQL checks balance at COMMIT after it can see all entries.
+The migrator applies ordered schema changes once, records them, and prevents
+concurrent migration commands from racing.
 ~~~

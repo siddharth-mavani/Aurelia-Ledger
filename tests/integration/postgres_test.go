@@ -72,14 +72,24 @@ func TestPostgresConnection(t *testing.T) {
 func applySchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
-	_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS ledger_entries, ledger_transactions, ledger_accounts CASCADE`)
+	_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS schema_migrations, ledger_entries, ledger_transactions, ledger_accounts CASCADE`)
 	_, _ = db.ExecContext(ctx, `DROP FUNCTION IF EXISTS ledger_assert_transaction_balanced() CASCADE`)
 	_, _ = db.ExecContext(ctx, `DROP FUNCTION IF EXISTS ledger_reject_journal_mutation() CASCADE`)
-	schema, err := os.ReadFile(filepath.Join("..", "..", "migrations", "000001_create_ledger.sql"))
+	migrations, err := postgres.LoadMigrations(filepath.Join("..", "..", "migrations"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, string(schema)); err != nil {
-		t.Fatalf("apply Phase 1 schema: %v", err)
+	if err := postgres.ApplyMigrations(ctx, db, migrations); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	if err := postgres.ApplyMigrations(ctx, db, migrations); err != nil {
+		t.Fatalf("rerun migrations: %v", err)
+	}
+	var applied int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != len(migrations) {
+		t.Fatalf("recorded migrations = %d, want %d", applied, len(migrations))
 	}
 }

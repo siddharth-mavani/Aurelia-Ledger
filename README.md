@@ -13,10 +13,10 @@ the durable journal, domain contract, and application health endpoint.
    export DATABASE_URL='postgres://postgres:postgres@localhost:5432/tokenledger?sslmode=disable'
    ```
 
-2. Apply the schema in one transaction:
+2. Apply schema migrations. This is required before starting the server and is safe to rerun:
 
    ```bash
-   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f migrations/000001_create_ledger.sql
+   go run ./cmd/migrate up
    ```
 
 3. Run tests:
@@ -35,7 +35,7 @@ the durable journal, domain contract, and application health endpoint.
    # {"status":"ok"}
    ```
 
-Inspect the journal with `psql "$DATABASE_URL" -c '\\d ledger_transactions'`.
+Inspect the journal with `psql "$DATABASE_URL" -c '\d ledger_transactions'`.
 
 ## Domain contract
 
