@@ -9,12 +9,14 @@ import (
 type Config struct {
 	DatabaseURL string
 	ListenAddr  string
+	APIToken    string
 }
 
 func Load() (Config, error) {
 	config := Config{
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		ListenAddr:  os.Getenv("LISTEN_ADDR"),
+		APIToken:    os.Getenv("TOKENLEDGER_API_TOKEN"),
 	}
 	if config.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL is required")

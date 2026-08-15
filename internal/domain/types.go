@@ -3,6 +3,7 @@ package domain
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,22 @@ func (a Amount) Validate() error {
 type Metadata json.RawMessage
 
 func EmptyMetadata() Metadata { return Metadata(`{}`) }
+
+// UnmarshalJSON preserves a JSON value as raw bytes so handlers can validate
+// that it is an object before it reaches the database.
+func (m *Metadata) UnmarshalJSON(data []byte) error {
+	*m = append((*m)[:0], data...)
+	return nil
+}
+
+// MarshalJSON writes metadata as its JSON object rather than encoding its raw
+// bytes as a base64 string.
+func (m Metadata) MarshalJSON() ([]byte, error) {
+	if len(m) == 0 {
+		return []byte(`{}`), nil
+	}
+	return m, nil
+}
 
 func (m Metadata) Validate() error {
 	if len(m) == 0 {
@@ -68,16 +85,54 @@ func (t TransactionType) Validate() error {
 
 // OwnerRef identifies the application record that owns a transaction.
 type OwnerRef struct {
-	Type string
-	ID   int64
+	Type string `json:"type"`
+	ID   int64  `json:"id"`
 }
 
 func (o OwnerRef) Valid() bool { return o.Type != "" && o.ID > 0 }
 
+type OwnerType string
+
+const (
+	CustomerOwner OwnerType = "customer"
+	TeamOwner     OwnerType = "team"
+	ProjectOwner  OwnerType = "project"
+)
+
+func (t OwnerType) Validate() error {
+	switch t {
+	case CustomerOwner, TeamOwner, ProjectOwner:
+		return nil
+	default:
+		return fmt.Errorf("%w: owner type %q", ErrInvalidOwner, t)
+	}
+}
+
+type Owner struct {
+	ID            int64     `json:"id"`
+	Type          OwnerType `json:"type"`
+	ExternalRef   string    `json:"external_ref"`
+	DisplayName   string    `json:"display_name"`
+	CachedBalance int64     `json:"cached_balance"`
+	Metadata      Metadata  `json:"metadata"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func (o Owner) Validate() error {
+	if err := o.Type.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(o.ExternalRef) == "" || strings.TrimSpace(o.DisplayName) == "" {
+		return fmt.Errorf("%w: external reference and display name are required", ErrInvalidOwner)
+	}
+	return o.Metadata.Validate()
+}
+
 // IdempotencyKey identifies a request in an external source namespace.
 type IdempotencyKey struct {
-	Source string
-	ID     string
+	Source string `json:"source"`
+	ID     string `json:"id"`
 }
 
 func (k IdempotencyKey) Validate() error {
@@ -88,46 +143,46 @@ func (k IdempotencyKey) Validate() error {
 }
 
 type Account struct {
-	ID             int64
-	Code           string
-	Name           string
-	CurrentBalance int64
-	Metadata       Metadata
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID             int64     `json:"id"`
+	Code           string    `json:"code"`
+	Name           string    `json:"name"`
+	CurrentBalance int64     `json:"current_balance"`
+	Metadata       Metadata  `json:"metadata"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type Transaction struct {
-	ID                  int64
-	Type                TransactionType
-	Description         string
-	Owner               *OwnerRef
-	ParentTransactionID *int64
-	IdempotencyKey      IdempotencyKey
-	Metadata            Metadata
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                  int64           `json:"id"`
+	Type                TransactionType `json:"type"`
+	Description         string          `json:"description"`
+	Owner               *OwnerRef       `json:"owner"`
+	ParentTransactionID *int64          `json:"parent_transaction_id,omitempty"`
+	IdempotencyKey      IdempotencyKey  `json:"idempotency_key"`
+	Metadata            Metadata        `json:"metadata"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
 }
 
 type Entry struct {
-	ID            int64
-	AccountID     int64
-	TransactionID int64
-	Side          EntrySide
-	Amount        Amount
-	Metadata      Metadata
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID            int64     `json:"id"`
+	AccountID     int64     `json:"account_id"`
+	TransactionID int64     `json:"transaction_id"`
+	Side          EntrySide `json:"side"`
+	Amount        Amount    `json:"amount"`
+	Metadata      Metadata  `json:"metadata"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // Posting is an unpersisted balanced entry supplied to a write operation.
 type Posting struct {
-	AccountCode     string
-	AccountName     string
-	Side            EntrySide
-	Amount          Amount
-	Metadata        Metadata
-	EnforcePositive bool
+	AccountCode     string    `json:"account_code"`
+	AccountName     string    `json:"account_name"`
+	Side            EntrySide `json:"side"`
+	Amount          Amount    `json:"amount"`
+	Metadata        Metadata  `json:"metadata"`
+	EnforcePositive bool      `json:"-"`
 }
 
 func (p Posting) Validate() error {

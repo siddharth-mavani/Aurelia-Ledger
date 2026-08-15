@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -58,5 +59,22 @@ func TestMetadataAndIdempotencyValidation(t *testing.T) {
 	}
 	if err := (domain.IdempotencyKey{Source: "stripe", ID: "invoice-1"}).Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMetadataJSONRoundTrip(t *testing.T) {
+	var metadata domain.Metadata
+	if err := json.Unmarshal([]byte(`{"origin":"api"}`), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if err := metadata.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"origin":"api"}` {
+		t.Fatalf("metadata JSON = %s", encoded)
 	}
 }

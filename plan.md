@@ -48,7 +48,7 @@ Set `TOKEN_LEDGER_TEST_DATABASE_URL` to a disposable PostgreSQL database to exec
 - Add `ledger_accounts.owner_id` and owner-account indexes. Wallet accounts use one owner; source and sink accounts remain system-owned. Retain `owner_type` on transaction headers so the model can support customer, team, and project ownership.
 - Add foreign-key/index migrations only in forward-compatible steps; do not modify the Phase-1 migration after it has been applied anywhere.
 
-`ledger_owners.owner_type` is one of `customer`, `team`, or `project`; `external_ref` and `display_name` are non-empty. `ledger_transactions.owner_id` becomes a nullable foreign key to `ledger_owners(id)`. `owner_type` remains a non-null value whenever `owner_id` is present; the posting service verifies it equals the referenced owner's type. `ledger_accounts.owner_id` is nullable and references `ledger_owners(id)`; owner wallet account-code formation is enforced in the posting service. System source/sink accounts always have `owner_id IS NULL`.
+`ledger_owners.owner_type` is one of `customer`, `team`, or `project`; `external_ref` and `display_name` are non-empty. `ledger_transactions.owner_id` becomes a nullable foreign key to `ledger_owners(id)`: it identifies the business owner of a transaction. `owner_type` remains a non-null value whenever `owner_id` is present; the posting service verifies it equals the referenced owner's type. `ledger_accounts.owner_id` is nullable and references `ledger_owners(id)`: it identifies the owner of a wallet account. `ledger_entries.account_id` continues to reference `ledger_accounts(id)` and identifies the account affected by that entry. No `account_role` column is used; account code is the canonical account identity and the posting service enforces `wallet:<owner_id>` with matching `ledger_accounts.owner_id`, plus system-owned `source:<name>` and `sink:<name>` accounts with `owner_id IS NULL`.
 
 ### Service and database implementation
 
@@ -64,6 +64,7 @@ Add `internal/httpapi` for routing, JSON decoding, request IDs, validation, and 
 
 ```text
 POST /v1/owners
+POST /v1/register-sources
 POST /v1/owners/{ownerID}/deposits
 POST /v1/owners/{ownerID}/spends
 POST /v1/owners/{ownerID}/adjustments
@@ -83,9 +84,11 @@ Every successful response is JSON. Every error has this exact shape:
 
 `POST /v1/owners` accepts `{"type":"customer","external_ref":"alice@example.com","display_name":"Alice","metadata":{}}` and returns `201` with `{"id":1,"type":"customer","external_ref":"alice@example.com","display_name":"Alice","cached_balance":0,"metadata":{}}`.
 
+`POST /v1/register-sources` accepts `{"name":"stripe","display_name":"Stripe","metadata":{}}` and creates the system-owned `source:stripe` account. Source names use lowercase letters, digits, hyphens, and underscores. Deposits reject unregistered sources; `source:other` and `sink:spend` are provisioned by migration. Owner creation creates `wallet:<owner-id>` in the same transaction. Normal postings lock existing accounts only.
+
 Deposit and spend requests accept `{"amount":100,"description":"Token purchase","external_source":"stripe","external_id":"invoice_123","metadata":{}}`; `external_source` and `external_id` are both optional but must occur together. Deposit uses `source:<external_source>` or `source:other` when absent. Both routes return `201` with `{"transaction_id":123,"owner_id":1,"available_balance":100}`. A duplicate pair always returns `409 duplicate_transaction`; it never returns a prior result.
 
-Adjustment requests accept `{"description":"Manual correction","external_source":"admin","external_id":"adj_1","metadata":{},"postings":[{"account_code":"wallet:1","account_name":"Customer 1 Wallet","side":"debit","amount":10,"metadata":{}},{"account_code":"source:admin","account_name":"Admin Source","side":"credit","amount":10,"metadata":{}}]}` and return the same transaction result. Balance returns `{"owner_id":1,"available_balance":100}`. Transaction reads return headers with entries ordered by entry ID. List requests accept `limit` (default 50, max 100) and an opaque base64 cursor encoding `(created_at,id)`; responses are `{"items":[...],"next_cursor":"..."}`. Invalid/malformed cursors return `400 validation_error`.
+Adjustment requests accept `{"description":"Manual correction","external_source":"admin","external_id":"adj_1","metadata":{},"postings":[{"account_code":"wallet:1","account_name":"Customer 1 Wallet","side":"debit","amount":10,"metadata":{}},{"account_code":"source:stripe","account_name":"Stripe Source","side":"credit","amount":10,"metadata":{}}]}` and return the same transaction result. Every referenced system account must already be registered. Balance returns `{"owner_id":1,"available_balance":100}`. Transaction reads return headers with entries ordered by entry ID. List requests accept `limit` (default 50, max 100) and an opaque base64 cursor encoding `(created_at,id)`; responses are `{"items":[...],"next_cursor":"..."}`. Invalid/malformed cursors return `400 validation_error`.
 
 The server must refuse startup if `TOKENLEDGER_API_TOKEN` is empty. `/healthz` is intentionally public. `/v1/*` compares bearer tokens using `crypto/subtle.ConstantTimeCompare`; token rotation requires process restart in this initial release.
 

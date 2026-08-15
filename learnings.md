@@ -6,12 +6,9 @@ not only the features planned for later phases.
 
 ## What the application does now
 
-TokenLedger is an HTTP application with a PostgreSQL-backed ledger foundation.
-Today it can read configuration, connect to PostgreSQL, serve GET /healthz, and
-define/test database rules for future ledger writes.
-
-It does **not** yet expose an HTTP API to create accounts, deposits, spends, or
-history. That work is planned in Phase 2 in plan.md.
+TokenLedger is an HTTP application with a PostgreSQL-backed token ledger. It
+can create owners, register trusted deposit sources, record deposits, spends,
+and adjustments, read balances/history, and reconcile cached projections.
 
 ~~~text
 GET /healthz returning 200 {"status":"ok"}
@@ -40,9 +37,10 @@ cmd/migrate/main.go
   -> internal/database/postgres/migrator.go
        reads ordered SQL files, locks PostgreSQL, and applies missing files
 
-Future write path:
-HTTP request -> domain validation -> SQL transaction -> COMMIT
-                                       -> PostgreSQL verifies balance
+Write path:
+HTTP request -> authentication -> domain/service validation -> SQL transaction
+  -> lock owner and affected accounts -> write journal and projections -> COMMIT
+                                                               -> PostgreSQL verifies balance
 ~~~
 
 | Path | Purpose |
@@ -57,6 +55,9 @@ HTTP request -> domain validation -> SQL transaction -> COMMIT
 | internal/domain/types.go | Ledger types and early Go validation. |
 | internal/domain/errors.go | Named errors used by validation/tests. |
 | migrations/000001_create_ledger.sql | Tables, constraints, indexes, and triggers. |
+| migrations/000002_create_owners.sql | Owner records and owner foreign keys. |
+| internal/ledger | Account-code policy and owner/posting workflows. |
+| internal/httpapi | Bearer-token-protected Phase 2 HTTP API. |
 | tests/domain/types_test.go | Unit tests with no database. |
 | tests/integration/postgres_test.go | Optional real-PostgreSQL test. |
 | README.md | Setup and run commands. |
@@ -801,3 +802,347 @@ PostgreSQL checks balance at COMMIT after it can see all entries.
 The migrator applies ordered schema changes once, records them, and prevents
 concurrent migration commands from racing.
 ~~~
+
+## Phase 2: the owner, account, and journal model
+
+Phase 2 introduces an important distinction: an **owner** is not an accounting
+account.
+
+~~~text
+ledger_owners.id
+  ├─ ledger_transactions.owner_id  = who the business event belongs to
+  └─ ledger_accounts.owner_id      = who owns an owner wallet
+
+ledger_accounts.id
+  └─ ledger_entries.account_id     = which accounting account a posting changes
+~~~
+
+For example, a deposit for customer Alice can have this shape:
+
+~~~text
+Owner:                  Alice, ID 42
+Transaction owner:      owner_id = 42
+Wallet account:         code = wallet:42, account.owner_id = 42
+Source account:         code = source:stripe, account.owner_id = NULL
+
+Entries:
+  debit  wallet:42       100  (owner's available balance increases)
+  credit source:stripe   100  (the source side of the balanced event)
+~~~
+
+`ledger_owners` stores a business identity: `customer`, `team`, or `project`;
+an external reference; a display name; metadata; and a cached balance. Its
+database constraints reject unknown owner types, blank names/references, and
+duplicate `(owner_type, external_ref)` pairs.
+
+### Why `RETURNING` is used when creating an owner
+
+The owner repository inserts only caller-supplied values:
+
+~~~sql
+INSERT INTO ledger_owners (owner_type, external_ref, display_name, metadata)
+VALUES (...)
+RETURNING id, cached_balance, created_at, updated_at
+~~~
+
+The returned `cached_balance` is initially the default `0`, but returning it
+is still useful. PostgreSQL, not Go, produces the identity ID and timestamps.
+Returning all database-produced values gives the API the exact stored record
+without a second query, and remains correct if future defaults or triggers
+change.
+
+## Canonical account codes and source registration
+
+There is deliberately no `account_role` column. `ledger_accounts.code` is the
+unique business identifier of one account, and its canonical prefix establishes
+the role:
+
+| Code form | Meaning | `owner_id` |
+| --- | --- | --- |
+| `wallet:<owner-id>` | One owner's available-token wallet | Must equal that owner ID |
+| `source:<registered-name>` | System source used for deposits | `NULL` |
+| `sink:spend` | System sink used for spends | `NULL` |
+
+The service validates this convention before any write. Thus a transaction for
+owner 42 cannot use `wallet:99` merely because both rows exist.
+
+### Account provisioning policy
+
+Creation and locking are now separate operations.
+
+~~~text
+CreateOwner
+  -> inserts the owner
+  -> creates wallet:<owner-id> in the same transaction
+
+Migration startup
+  -> provisions source:other and sink:spend
+
+POST /v1/register-sources
+  -> creates a named system source, for example source:stripe
+
+Deposit / spend / adjustment
+  -> locks existing accounts only
+  -> rejects a missing account
+~~~
+
+This matters for security and correctness. A client typo such as
+`external_source="stirpe"` must not silently create `source:stirpe` and turn it
+into a permanent ledger account. An authenticated operator first registers a
+source:
+
+~~~text
+POST /v1/register-sources
+{"name":"stripe","display_name":"Stripe","metadata":{}}
+~~~
+
+Source names are restricted to lowercase letters, digits, hyphens, and
+underscores. A deposit that names an unregistered source returns `not_found`.
+
+## Transactions, posting, and atomicity
+
+`internal/ledger/service.go` is the application workflow layer. It owns the
+business sequence; repositories only perform focused SQL operations.
+
+~~~text
+Deposit/Spend/Adjust
+  -> build or accept postings
+  -> validate request, metadata, idempotency key, and posting balance
+  -> begin one SQL transaction
+  -> lock owner and required existing accounts
+  -> calculate signed account deltas
+  -> reject an overspend if required
+  -> insert immutable transaction header and entries
+  -> update account.current_balance and owner.cached_balance
+  -> commit
+~~~
+
+The transaction wrapper does not itself make data safe. It groups the work so
+PostgreSQL can atomically commit all changes or roll all of them back. The
+database also enforces foreign keys, positive amounts, append-only journal rows,
+and deferred debit/credit balancing at commit.
+
+### Why validation happens before SQL and again at the repository boundary
+
+`post` validates early because it must know the postings are well formed before
+it selects account codes, starts locks, or calculates balances. Early rejection
+avoids unnecessary database work and brief blocking of valid requests.
+
+`InsertEntries` also validates `transactionID`, the posting set, and that every
+posting has a locked account in the supplied account map. This is intentional
+defense in depth:
+
+~~~text
+Service validation     -> clear, early business/API error
+Repository validation  -> safe persistence boundary if a future caller bypasses service
+PostgreSQL constraints -> final durable guard even if application code is wrong
+~~~
+
+The small CPU cost of validating a short posting list twice is negligible
+compared with the value of preventing an unsafe repository call.
+
+### Idempotency
+
+`external_source` and `external_id` form an optional pair. They are either both
+present or both absent. Together they identify one external business event:
+
+~~~text
+stripe + invoice_123 = one payment notification
+~~~
+
+The database has a partial unique index on that pair. If the same notification
+is retried, insertion fails with a unique violation, the service returns
+`duplicate_transaction`, and the surrounding transaction rolls back. Balances
+therefore do not change twice.
+
+## Row locks and concurrent writes
+
+Before changing a balance, the service locks the owner and all affected accounts
+inside its SQL transaction.
+
+~~~sql
+SELECT ... FROM ledger_owners WHERE id = $1 FOR UPDATE;
+SELECT ... FROM ledger_accounts WHERE code = $1 FOR UPDATE;
+~~~
+
+`FOR UPDATE` is a locking read. It is not a normal read lock: PostgreSQL lets
+ordinary readers see a committed version using MVCC, but prevents a conflicting
+writer or another locking reader from proceeding for that row until the current
+transaction commits or rolls back.
+
+The lock is acquired when PostgreSQL executes the `SELECT ... FOR UPDATE`. It
+is released automatically by the transaction's `COMMIT` or `ROLLBACK`; Go does
+not manually unlock it.
+
+Example: two requests both try to spend 70 from a wallet with 100.
+
+~~~text
+Request A locks wallet:42, sees 100, writes new balance 30, commits.
+Request B then obtains the lock, sees 30, calculates -40, and rolls back with
+insufficient_funds.
+~~~
+
+Accounts are locked in ascending account-code order. If two adjustments name
+the same accounts in opposite input order, both still request locks in the same
+order. This avoids the classic deadlock pattern where each transaction holds
+one account while waiting for the other.
+
+## Foreign keys: existence versus semantic correctness
+
+An FK from `ledger_transactions.owner_id` to `ledger_owners.id` proves only
+that an owner ID exists. It cannot, by itself, prove that the transaction's
+stored owner type matches the owner's actual type.
+
+Bad direct SQL example:
+
+~~~text
+ledger_owners:       id=42, owner_type=customer
+transaction attempt: owner_id=42, owner_type=team
+~~~
+
+The Phase 2 owner migration adds a unique owner pair `(id, owner_type)` and a
+composite foreign key:
+
+~~~text
+(ledger_transactions.owner_id, ledger_transactions.owner_type)
+  -> (ledger_owners.id, ledger_owners.owner_type)
+~~~
+
+There is no `(42, team)` owner pair, so PostgreSQL rejects the bad header even
+if direct SQL bypasses the Go posting service. The service still performs its
+own validation because an FK cannot verify that a transaction's postings use
+the correct owner wallet.
+
+## Repository interfaces and query methods
+
+Both `*sql.DB` and `*sql.Tx` can run queries. Repository reads use narrow
+interfaces so they can work either outside a transaction (`*sql.DB`) or inside
+one (`*sql.Tx`) without duplicating methods.
+
+~~~go
+type singleRowQuerier interface {
+    QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type queryExecutor interface {
+    singleRowQuerier
+    QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+~~~
+
+`QueryRowContext` is for an expected zero-or-one row. It returns `*sql.Row`,
+which is read with `.Scan(...)`. `QueryContext` is for many rows. It returns
+`*sql.Rows`, which is iterated with `rows.Next()`, scanned one row at a time,
+and closed with `rows.Close()`.
+
+The earlier runtime type assertion helper was removed. `queryExecutor` now
+states the full compile-time requirement for history queries. This is clearer:
+the Go compiler verifies that a supplied database value supports both one-row
+and many-row queries.
+
+## Cursor pagination
+
+A cursor is a bookmark, not an authorization token. Transaction history is
+ordered newest-first by `(created_at, id)`.
+
+~~~text
+First page, limit 2:
+  10:05 / 105
+  10:04 / 104
+
+next_cursor represents: (10:04, 104)
+
+Second page asks for rows older than that pair:
+  10:03 / 103
+  10:02 / 102
+~~~
+
+The SQL uses:
+
+~~~sql
+AND (created_at, id) < ($cursor_created_at, $cursor_id)
+ORDER BY created_at DESC, id DESC
+~~~
+
+The ID is a tie-breaker when two transactions share a timestamp. Cursor
+pagination is preferable to `OFFSET` for growing history because it avoids
+walking past thousands of older rows and is less likely to duplicate/skip rows
+when new transactions arrive during pagination. The cursor is Base64-encoded
+JSON for transport; Base64 is not encryption.
+
+## Phase 2 HTTP API and security
+
+`/healthz` is public. Every `/v1/*` route requires:
+
+~~~text
+Authorization: Bearer <TOKENLEDGER_API_TOKEN>
+~~~
+
+The server refuses to start without `TOKENLEDGER_API_TOKEN`. The migration
+command does not require it, because schema migration is not HTTP service
+operation. Token comparison uses `crypto/subtle.ConstantTimeCompare`, avoiding
+early-exit byte comparisons that can leak prefix information through timing.
+
+The successful Phase 2 routes are:
+
+~~~text
+POST /v1/owners
+POST /v1/register-sources
+POST /v1/owners/{ownerID}/deposits
+POST /v1/owners/{ownerID}/spends
+POST /v1/owners/{ownerID}/adjustments
+GET  /v1/owners/{ownerID}/balance
+GET  /v1/owners/{ownerID}/transactions
+GET  /v1/transactions/{transactionID}
+POST /v1/owners/{ownerID}/reconcile
+~~~
+
+All errors have one stable JSON shape:
+
+~~~json
+{"error":{"code":"validation_error","message":"..."}}
+~~~
+
+Expected error classes are validation (`400`), unauthenticated (`401`), absent
+owner/account/transaction (`404`), insufficient funds or duplicate transaction
+(`409`), and unexpected internal failures (`500`).
+
+## Reconciliation and cached projections
+
+The append-only journal is authoritative. `ledger_accounts.current_balance` and
+`ledger_owners.cached_balance` are fast projections derived from it.
+
+Reconciliation recomputes the canonical wallet balance directly from entries:
+
+~~~text
+debit  amount -> add amount
+credit amount -> subtract amount
+~~~
+
+It then updates both projections in one transaction. It does not create a new
+journal transaction because no new business event occurred: it repairs derived
+state that has drifted from existing history.
+
+## What the Phase 2 tests prove
+
+The opt-in PostgreSQL integration suite uses an empty disposable database. It
+applies migrations twice to prove idempotency, then tests:
+
+~~~text
+- immutable journal rows and deferred balance checks
+- automatic owner-wallet creation
+- source registration and unregistered-source rejection
+- deposits, duplicate idempotency, spends, and overspend rollback
+- balanced adjustments, metadata, history, cursor pagination, and transaction reads
+- reconciliation after deliberately corrupting cached projections
+- composite owner-type foreign-key rejection
+- simultaneous owner creation
+- five concurrent deposits
+- two competing overspends
+- opposite posting input order with deterministic account locks
+- every authenticated HTTP endpoint and auth failure
+~~~
+
+The tests run only when `TOKEN_LEDGER_TEST_DATABASE_URL` points to disposable
+PostgreSQL. This is intentional: they drop/recreate tables and must never run
+against valuable data.

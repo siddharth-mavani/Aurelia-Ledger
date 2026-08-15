@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -14,6 +13,8 @@ import (
 
 	"tokenledger/internal/config"
 	"tokenledger/internal/database/postgres"
+	"tokenledger/internal/httpapi"
+	"tokenledger/internal/ledger"
 )
 
 func main() {
@@ -21,6 +22,10 @@ func main() {
 	config, err := config.Load()
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+	if config.APIToken == "" {
+		logger.Error("invalid configuration", "error", "TOKENLEDGER_API_TOKEN is required")
 		os.Exit(1)
 	}
 
@@ -33,15 +38,8 @@ func main() {
 	}
 	defer store.Close()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := store.DB().PingContext(r.Context()); err != nil {
-			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
+	service := ledger.NewService(store)
+	mux := httpapi.New(service, config.APIToken, store.DB().PingContext)
 
 	server := &http.Server{Addr: config.ListenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
