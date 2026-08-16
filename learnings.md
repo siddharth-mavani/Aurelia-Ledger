@@ -556,6 +556,101 @@ Total debit amount must equal total credit amount.
 Amounts are positive integers; entry_type determines whether each amount is a
 debit or credit.
 
+## Double-entry accounting: what it means here and where it is enforced
+
+A **double-entry ledger** does not store a balance change by itself, such as
+“add 100 to Alice.” It records the two sides of the same event: which account
+received value and which account supplied it. Every transaction must have at
+least two entries in practice, and the total amount on its debit side must
+equal the total on its credit side.
+
+For this project, the balance convention is:
+
+~~~text
+account balance = total debits - total credits
+~~~
+
+So a token purchase is not merely `wallet:42 = 100`. It is this balanced
+event:
+
+~~~text
+debit  wallet:42       100     wallet balance increases by 100
+credit source:stripe   100     source account provides the other side
+
+total debits = 100
+total credits = 100
+~~~
+
+The same idea applies to every workflow, although the counterpart account
+changes:
+
+| Business event | Debit entry | Credit entry | Meaning |
+| --- | --- | --- | --- |
+| Deposit 100 | `wallet:42` | `source:stripe` | Tokens become available to the owner. |
+| Direct spend 25 | `sink:spend` | `wallet:42` | Available tokens are consumed immediately. |
+| Reserve 80 | `wallet:42:reserved` | `wallet:42` | Tokens move from available to held; no tokens are created or destroyed. |
+| Capture 30 | `sink:consumed` | `wallet:42:reserved` | Held tokens are consumed after the external work succeeds. |
+| Release 50 | `wallet:42` | `wallet:42:reserved` | Unused held tokens become available again. |
+
+This model gives a complete audit trail. To understand why a wallet changed,
+read the immutable `ledger_transactions` header and its related
+`ledger_entries`; do not treat `ledger_accounts.current_balance` or
+`ledger_owners.cached_balance` as the only evidence. Those two balance columns
+are fast, mutable projections that can be rebuilt from the journal.
+
+### Enforcement happens in layers
+
+The project intentionally does not trust only the HTTP handler or only the
+database. Each layer catches a different class of mistake.
+
+| Layer | Location | What it enforces |
+| --- | --- | --- |
+| Request boundary | `internal/httpapi/api.go` | Parses JSON, rejects unknown fields, checks bearer authentication, and converts domain failures to HTTP errors. |
+| Domain validation | `internal/domain/types.go` | `Amount.Validate` rejects zero/negative amounts. `Posting.Validate` requires an account, name, valid debit/credit side, positive amount, and object-shaped metadata. `ValidatePostings` requires nonempty balanced totals. |
+| Workflow construction | `internal/ledger/service.go` | `Deposit`, `Spend`, `Reserve`, `Capture`, and `Release` build both sides of their postings. `post` validates inputs before opening the write path; `postInTransaction` calculates balance deltas and rejects normal spends/reservations that would make an enforced account negative. |
+| Transaction and locks | `internal/database/postgres/store.go`, `internal/database/postgres/ledger_repository.go` | `WithinTransaction` makes the header, entries, and projection updates all commit or roll back together. `LockExistingAccounts` uses `SELECT ... FOR UPDATE` in sorted account-code order before balances are calculated. |
+| Database schema | `migrations/000001_create_ledger.sql` | `ledger_entries.amount > 0`, allowed entry types, foreign keys, immutable-journal triggers, and deferred balance constraint triggers protect against future code paths and direct SQL mistakes. |
+
+### The normal write path
+
+For a deposit, spend, reservation, or adjustment, the exact high-level path is:
+
+~~~text
+HTTP route
+  -> Service builds/accepts Posting values
+  -> domain.ValidatePostings checks positive, valid, balanced entries
+  -> Store.WithinTransaction begins PostgreSQL transaction
+  -> owner and all existing accounts are locked with FOR UPDATE
+  -> Service calculates debit/credit deltas and overdraft checks where required
+  -> INSERT ledger_transactions
+  -> INSERT ledger_entries
+  -> UPDATE current balance projections
+  -> COMMIT
+       -> deferred PostgreSQL trigger independently verifies entry count and
+          debit total = credit total
+~~~
+
+The deferred trigger is important. A header must be inserted before entries can
+reference its generated transaction ID, so checking immediately after the
+header insert would incorrectly reject a valid in-progress transaction.
+`DEFERRABLE INITIALLY DEFERRED` postpones the check until `COMMIT`, when
+PostgreSQL can inspect the complete set of entries. If a bug writes one entry,
+unequal totals, or no entries, the commit fails and the entire SQL transaction
+rolls back.
+
+Double-entry balance alone does **not** mean an owner has enough spendable
+tokens. The `Spend` and `Reserve` workflows add a separate available-funds
+rule by setting `EnforcePositive` on the wallet credit. After locking the
+account, `postInTransaction` rejects a calculated negative wallet balance with
+`ErrInsufficientFunds`. Adjustments are intentionally different: they accept
+trusted, explicit balanced postings for corrections, so their supplied postings
+are not automatically treated as ordinary spend authorization.
+
+Finally, the journal is append-only. PostgreSQL triggers reject updates and
+deletes of `ledger_transactions` and `ledger_entries`. A correction must be a
+new balanced adjustment or reversal, preserving the original event and its
+reason in history.
+
 ## Table rules: primary keys, foreign keys, checks
 
 ~~~sql
