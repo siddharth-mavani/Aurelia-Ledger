@@ -21,6 +21,10 @@ import (
 	"tokenledger/internal/ledger"
 )
 
+type externalWorkFunc func(context.Context) error
+
+func (f externalWorkFunc) Execute(ctx context.Context) error { return f(ctx) }
+
 // Integration tests are intentionally opt-in until a PostgreSQL test database is supplied.
 // DATABASE_URL must point to an empty, disposable PostgreSQL database.
 func TestPostgresConnection(t *testing.T) {
@@ -254,6 +258,119 @@ func TestPostgresConnection(t *testing.T) {
 		}
 	})
 
+	t.Run("executes reservation workflows without over-settlement", func(t *testing.T) {
+		service := ledger.NewService(store)
+		newFundedOwner := func(ref string, amount domain.Amount) domain.Owner {
+			t.Helper()
+			owner, err := service.CreateOwner(ctx, ledger.CreateOwnerCommand{Type: domain.CustomerOwner, ExternalRef: ref, DisplayName: ref, Metadata: domain.EmptyMetadata()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = service.Deposit(ctx, ledger.DepositCommand{OwnerID: owner.ID, Amount: amount, Description: "fund", Metadata: domain.EmptyMetadata()}); err != nil {
+				t.Fatal(err)
+			}
+			return owner
+		}
+		owner := newFundedOwner("reservation-primary", 100)
+		reservation, err := service.Reserve(ctx, ledger.ReserveCommand{OwnerID: owner.ID, Amount: 80, Description: "reserve", Metadata: domain.EmptyMetadata()})
+		if err != nil || reservation.Status != "open" {
+			t.Fatalf("reserve %#v, %v", reservation, err)
+		}
+		var reservedCode string
+		if err := store.DB().QueryRowContext(ctx, `SELECT code FROM ledger_accounts WHERE owner_id = $1 AND code LIKE 'wallet:%:reserved'`, owner.ID).Scan(&reservedCode); err != nil || reservedCode != fmt.Sprintf("wallet:%d:reserved", owner.ID) {
+			t.Fatalf("reserved code %q, %v", reservedCode, err)
+		}
+		if _, err = service.Spend(ctx, ledger.SpendCommand{OwnerID: owner.ID, Amount: 21, Description: "blocked", Metadata: domain.EmptyMetadata()}); !errors.Is(err, domain.ErrInsufficientFunds) {
+			t.Fatalf("spend while reserved = %v", err)
+		}
+		if _, err = service.Capture(ctx, ledger.SettlementCommand{ReservationID: reservation.ReservationTransactionID, Metadata: domain.EmptyMetadata()}); !errors.Is(err, domain.ErrInvalidAmount) {
+			t.Fatalf("missing capture amount = %v", err)
+		}
+		captureAmount := domain.Amount(30)
+		reservation, err = service.Capture(ctx, ledger.SettlementCommand{ReservationID: reservation.ReservationTransactionID, Amount: &captureAmount, Metadata: domain.EmptyMetadata()})
+		if err != nil || reservation.CapturedAmount != 30 || reservation.Status != "open" {
+			t.Fatalf("partial capture %#v, %v", reservation, err)
+		}
+		reservation, err = service.Release(ctx, ledger.SettlementCommand{ReservationID: reservation.ReservationTransactionID, Metadata: domain.EmptyMetadata()})
+		if err != nil || reservation.ReleasedAmount != 50 || reservation.Status != "settled" {
+			t.Fatalf("default release %#v, %v", reservation, err)
+		}
+		if balance, err := service.GetBalance(ctx, owner.ID); err != nil || balance != 70 {
+			t.Fatalf("balance after capture/release %d, %v", balance, err)
+		}
+		if got, err := service.GetReservation(ctx, reservation.ReservationTransactionID); err != nil || got.ReservationTransactionID != reservation.ReservationTransactionID || got.CapturedAmount != 30 || got.ReleasedAmount != 50 || got.Status != "settled" {
+			t.Fatalf("get reservation %#v, %v", got, err)
+		}
+		one := domain.Amount(1)
+		if _, err = service.Capture(ctx, ledger.SettlementCommand{ReservationID: reservation.ReservationTransactionID, Amount: &one, Metadata: domain.EmptyMetadata()}); !errors.Is(err, domain.ErrReservationOverSettled) {
+			t.Fatalf("capture after settlement = %v", err)
+		}
+		if _, err = service.Release(ctx, ledger.SettlementCommand{ReservationID: reservation.ReservationTransactionID, Metadata: domain.EmptyMetadata()}); !errors.Is(err, domain.ErrReservationOverSettled) {
+			t.Fatalf("repeat release = %v", err)
+		}
+
+		second, err := service.Reserve(ctx, ledger.ReserveCommand{OwnerID: owner.ID, Amount: 60, Description: "second reserve", Metadata: domain.EmptyMetadata()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseAmount := domain.Amount(20)
+		if _, err = service.Release(ctx, ledger.SettlementCommand{ReservationID: second.ReservationTransactionID, Amount: &releaseAmount, Metadata: domain.EmptyMetadata()}); err != nil {
+			t.Fatal(err)
+		}
+		captureAmount = 40
+		second, err = service.Capture(ctx, ledger.SettlementCommand{ReservationID: second.ReservationTransactionID, Amount: &captureAmount, Metadata: domain.EmptyMetadata()})
+		if err != nil || second.Status != "settled" || second.CapturedAmount != 40 || second.ReleasedAmount != 20 {
+			t.Fatalf("release then capture %#v, %v", second, err)
+		}
+
+		concurrent := newFundedOwner("reservation-concurrent", 100)
+		third, err := service.Reserve(ctx, ledger.ReserveCommand{OwnerID: concurrent.ID, Amount: 100, Description: "concurrent reserve", Metadata: domain.EmptyMetadata()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		errs := make(chan error, 2)
+		var group sync.WaitGroup
+		for range 2 {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				amount := domain.Amount(60)
+				_, err := service.Capture(ctx, ledger.SettlementCommand{ReservationID: third.ReservationTransactionID, Amount: &amount, Metadata: domain.EmptyMetadata()})
+				errs <- err
+			}()
+		}
+		group.Wait()
+		close(errs)
+		successes := 0
+		for err := range errs {
+			if err == nil {
+				successes++
+			} else if !errors.Is(err, domain.ErrReservationOverSettled) {
+				t.Fatalf("concurrent capture = %v", err)
+			}
+		}
+		if successes != 1 {
+			t.Fatalf("concurrent captures succeeded %d times", successes)
+		}
+		if got, err := service.GetReservation(ctx, third.ReservationTransactionID); err != nil || got.CapturedAmount != 60 || got.Status != "open" {
+			t.Fatalf("concurrent reservation %#v, %v", got, err)
+		}
+
+		callbackOwner := newFundedOwner("reservation-callback", 20)
+		settled, err := service.SpendWithOperation(ctx, ledger.ReserveCommand{OwnerID: callbackOwner.ID, Amount: 10, Description: "callback success", Metadata: domain.EmptyMetadata()}, externalWorkFunc(func(context.Context) error { return nil }))
+		if err != nil || settled.Status != "settled" || settled.CapturedAmount != 10 {
+			t.Fatalf("callback success %#v, %v", settled, err)
+		}
+		callbackErr := errors.New("provider failed")
+		failed, err := service.SpendWithOperation(ctx, ledger.ReserveCommand{OwnerID: callbackOwner.ID, Amount: 5, Description: "callback failure", Metadata: domain.EmptyMetadata()}, externalWorkFunc(func(context.Context) error { return callbackErr }))
+		if !errors.Is(err, callbackErr) {
+			t.Fatalf("callback failure = %v", err)
+		}
+		if got, err := service.GetReservation(ctx, failed.ReservationTransactionID); err != nil || got.Status != "settled" || got.ReleasedAmount != 5 {
+			t.Fatalf("callback release %#v, %v", got, err)
+		}
+	})
+
 	t.Run("serves every Phase 2 endpoint", func(t *testing.T) {
 		api := httpapi.New(ledger.NewService(store), "test-token", store.DB().PingContext)
 		request := func(method, path, body string, authorized bool) *httptest.ResponseRecorder {
@@ -333,6 +450,31 @@ func TestPostgresConnection(t *testing.T) {
 		if response := request(http.MethodGet, fmt.Sprintf("/v1/transactions/%d", posted.TransactionID), "", true); response.Code != http.StatusOK {
 			t.Fatalf("transaction = %d: %s", response.Code, response.Body.String())
 		}
+		reserved := request(http.MethodPost, fmt.Sprintf("/v1/owners/%d/reservations", owner.ID), `{"amount":20,"description":"API reservation","metadata":{}}`, true)
+		if reserved.Code != http.StatusCreated {
+			t.Fatalf("reserve = %d: %s", reserved.Code, reserved.Body.String())
+		}
+		var reservation postgres.Reservation
+		if err := json.NewDecoder(reserved.Body).Decode(&reservation); err != nil {
+			t.Fatal(err)
+		}
+		if response := request(http.MethodPost, fmt.Sprintf("/v1/reservations/%d/capture", reservation.ReservationTransactionID), `{"metadata":{}}`, true); response.Code != http.StatusBadRequest {
+			t.Fatalf("missing capture amount = %d: %s", response.Code, response.Body.String())
+		}
+		captured := request(http.MethodPost, fmt.Sprintf("/v1/reservations/%d/capture", reservation.ReservationTransactionID), `{"amount":7,"metadata":{}}`, true)
+		if captured.Code != http.StatusCreated {
+			t.Fatalf("capture = %d: %s", captured.Code, captured.Body.String())
+		}
+		if response := request(http.MethodGet, fmt.Sprintf("/v1/reservations/%d", reservation.ReservationTransactionID), "", true); response.Code != http.StatusOK {
+			t.Fatalf("get reservation = %d: %s", response.Code, response.Body.String())
+		}
+		released := request(http.MethodPost, fmt.Sprintf("/v1/reservations/%d/release", reservation.ReservationTransactionID), `{}`, true)
+		if released.Code != http.StatusCreated {
+			t.Fatalf("default release = %d: %s", released.Code, released.Body.String())
+		}
+		if response := request(http.MethodPost, fmt.Sprintf("/v1/reservations/%d/capture", reservation.ReservationTransactionID), `{"amount":1}`, true); response.Code != http.StatusConflict {
+			t.Fatalf("capture after release = %d: %s", response.Code, response.Body.String())
+		}
 		if response := request(http.MethodPost, fmt.Sprintf("/v1/owners/%d/reconcile", owner.ID), "", true); response.Code != http.StatusOK {
 			t.Fatalf("reconcile = %d: %s", response.Code, response.Body.String())
 		}
@@ -342,7 +484,9 @@ func TestPostgresConnection(t *testing.T) {
 func applySchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
-	_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS schema_migrations, ledger_entries, ledger_transactions, ledger_accounts, ledger_owners CASCADE`)
+	// Drop child projections explicitly. CASCADE on ledger_transactions removes
+	// their foreign-key constraints, but does not remove the child tables.
+	_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS schema_migrations, ledger_reservations, ledger_entries, ledger_transactions, ledger_accounts, ledger_owners CASCADE`)
 	_, _ = db.ExecContext(ctx, `DROP FUNCTION IF EXISTS ledger_assert_transaction_balanced() CASCADE`)
 	_, _ = db.ExecContext(ctx, `DROP FUNCTION IF EXISTS ledger_reject_journal_mutation() CASCADE`)
 	migrations, err := postgres.LoadMigrations(filepath.Join("..", "..", "migrations"))

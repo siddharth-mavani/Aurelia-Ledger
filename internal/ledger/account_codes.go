@@ -25,6 +25,15 @@ func WalletAccountCode(ownerID int64) (string, error) {
 	return walletPrefix + strconv.FormatInt(ownerID, 10), nil
 }
 
+// ReservedAccountCode is the owner-scoped account holding funds unavailable for spend.
+func ReservedAccountCode(ownerID int64) (string, error) {
+	walletCode, err := WalletAccountCode(ownerID)
+	if err != nil {
+		return "", err
+	}
+	return walletCode + ":reserved", nil
+}
+
 // SourceAccountCode returns the canonical code for an explicitly registered source.
 func SourceAccountCode(name string) (string, error) {
 	if !sourceNamePattern.MatchString(name) {
@@ -46,7 +55,8 @@ func ValidateAccountCodeOwnership(code string, ownerID *int64) error {
 		if err != nil {
 			return err
 		}
-		if code != walletCode {
+		reservedCode, err := ReservedAccountCode(*ownerID)
+		if err != nil || (code != walletCode && code != reservedCode) {
 			return fmt.Errorf("%w: wallet code %q does not match owner %d", domain.ErrInvalidPosting, code, *ownerID)
 		}
 		return nil

@@ -16,6 +16,9 @@ func TestValidateAccountCodeOwnership(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "owner wallet", code: "wallet:42", ownerID: &ownerID},
+		{name: "owner reserved wallet", code: "wallet:42:reserved", ownerID: &ownerID},
+		{name: "wrong reserved owner", code: "wallet:99:reserved", ownerID: &ownerID, wantErr: true},
+		{name: "invalid wallet suffix", code: "wallet:42:other", ownerID: &ownerID, wantErr: true},
 		{name: "system source", code: "source:stripe"},
 		{name: "system sink", code: "sink:spend"},
 		{name: "wrong wallet owner", code: "wallet:99", ownerID: &ownerID, wantErr: true},

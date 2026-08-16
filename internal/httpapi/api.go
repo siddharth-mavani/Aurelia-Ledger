@@ -47,6 +47,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	a.route(w, r)
 }
+
 func (a *API) route(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "owners" {
@@ -95,8 +96,35 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 					a.reconcile(w, r, id)
 					return
 				}
+			case "reservations":
+				if r.Method == http.MethodPost {
+					a.reserve(w, r, id)
+					return
+				}
 			}
 		}
+	}
+	if len(parts) == 4 && parts[1] == "reservations" && (parts[3] == "capture" || parts[3] == "release") && r.Method == http.MethodPost {
+		id, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || id <= 0 {
+			writeError(w, 400, "validation_error", "reservation ID must be positive")
+			return
+		}
+		if parts[3] == "capture" {
+			a.capture(w, r, id)
+		} else {
+			a.release(w, r, id)
+		}
+		return
+	}
+	if len(parts) == 3 && parts[1] == "reservations" && r.Method == http.MethodGet {
+		id, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || id <= 0 {
+			writeError(w, 400, "validation_error", "reservation ID must be positive")
+			return
+		}
+		a.reservation(w, r, id)
+		return
 	}
 	if r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "transactions" {
 		id, err := strconv.ParseInt(parts[2], 10, 64)
@@ -196,6 +224,66 @@ func (a *API) spend(w http.ResponseWriter, r *http.Request, id int64) {
 		return
 	}
 	writeJSON(w, 201, out)
+}
+
+func (a *API) reserve(w http.ResponseWriter, r *http.Request, id int64) {
+	var q moneyRequest
+	if !decode(w, r, &q) {
+		return
+	}
+	c, err := q.command()
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	c.OwnerID = id
+	reservation, err := a.service.Reserve(r.Context(), ledger.ReserveCommand(c))
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, reservation)
+}
+
+type settlementRequest struct {
+	Amount         *domain.Amount  `json:"amount"`
+	Description    string          `json:"description"`
+	ExternalSource string          `json:"external_source"`
+	ExternalID     string          `json:"external_id"`
+	Metadata       domain.Metadata `json:"metadata"`
+}
+
+func (q settlementRequest) command(id int64) ledger.SettlementCommand {
+	return ledger.SettlementCommand{ReservationID: id, Amount: q.Amount, Description: q.Description, Key: domain.IdempotencyKey{Source: q.ExternalSource, ID: q.ExternalID}, Metadata: q.Metadata}
+}
+func (a *API) capture(w http.ResponseWriter, r *http.Request, id int64) { a.settle(w, r, id, true) }
+func (a *API) release(w http.ResponseWriter, r *http.Request, id int64) { a.settle(w, r, id, false) }
+func (a *API) settle(w http.ResponseWriter, r *http.Request, id int64, capture bool) {
+	var q settlementRequest
+	if !decode(w, r, &q) {
+		return
+	}
+	command := q.command(id)
+	var out postgres.Reservation
+	var err error
+	if capture {
+		out, err = a.service.Capture(r.Context(), command)
+	} else {
+		out, err = a.service.Release(r.Context(), command)
+	}
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+func (a *API) reservation(w http.ResponseWriter, r *http.Request, id int64) {
+	out, err := a.service.GetReservation(r.Context(), id)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type adjustmentRequest struct {
@@ -303,9 +391,9 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 }
 func respondError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, domain.ErrOwnerNotFound), errors.Is(err, domain.ErrTransactionNotFound), errors.Is(err, domain.ErrAccountNotFound):
+	case errors.Is(err, domain.ErrOwnerNotFound), errors.Is(err, domain.ErrTransactionNotFound), errors.Is(err, domain.ErrAccountNotFound), errors.Is(err, domain.ErrReservationNotFound):
 		writeError(w, 404, "not_found", err.Error())
-	case errors.Is(err, domain.ErrInsufficientFunds):
+	case errors.Is(err, domain.ErrInsufficientFunds), errors.Is(err, domain.ErrReservationOverSettled):
 		writeError(w, 409, "insufficient_funds", "insufficient funds")
 	case errors.Is(err, domain.ErrDuplicateTransaction):
 		writeError(w, 409, "duplicate_transaction", "duplicate transaction")

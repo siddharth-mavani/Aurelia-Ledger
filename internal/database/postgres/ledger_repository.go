@@ -95,11 +95,12 @@ func (LedgerRepository) UpdateAccountBalance(ctx context.Context, tx *sql.Tx, ac
 }
 
 type NewTransaction struct {
-	Type        domain.TransactionType
-	Description string
-	Owner       domain.OwnerRef
-	Key         domain.IdempotencyKey
-	Metadata    domain.Metadata
+	Type                domain.TransactionType
+	Description         string
+	Owner               domain.OwnerRef
+	ParentTransactionID *int64
+	Key                 domain.IdempotencyKey
+	Metadata            domain.Metadata
 }
 
 func (LedgerRepository) InsertTransaction(ctx context.Context, tx *sql.Tx, item NewTransaction) (domain.Transaction, error) {
@@ -120,9 +121,9 @@ func (LedgerRepository) InsertTransaction(ctx context.Context, tx *sql.Tx, item 
 	result.Owner = &item.Owner
 	result.IdempotencyKey, result.Metadata = item.Key, normalizeMetadata(item.Metadata)
 	err := tx.QueryRowContext(ctx, `
-		INSERT INTO ledger_transactions (transaction_type, description, owner_type, owner_id, external_source, external_id, metadata)
-		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7)
-		RETURNING id, created_at, updated_at`, item.Type, item.Description, item.Owner.Type, item.Owner.ID, item.Key.Source, item.Key.ID, result.Metadata,
+		INSERT INTO ledger_transactions (transaction_type, description, owner_type, owner_id, parent_transaction_id, external_source, external_id, metadata)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8)
+		RETURNING id, created_at, updated_at`, item.Type, item.Description, item.Owner.Type, item.Owner.ID, item.ParentTransactionID, item.Key.Source, item.Key.ID, result.Metadata,
 	).Scan(&result.ID, &result.CreatedAt, &result.UpdatedAt)
 	if isUniqueViolation(err) {
 		return domain.Transaction{}, fmt.Errorf("%w: %s/%s", domain.ErrDuplicateTransaction, item.Key.Source, item.Key.ID)
@@ -164,8 +165,9 @@ func (LedgerRepository) GetTransaction(ctx context.Context, db queryExecutor, id
 	var ownerType sql.NullString
 	var ownerID sql.NullInt64
 	var source, externalID sql.NullString
-	err := db.QueryRowContext(ctx, `SELECT id, transaction_type, description, owner_type, owner_id, external_source, external_id, metadata, created_at, updated_at FROM ledger_transactions WHERE id = $1`, id).
-		Scan(&record.Transaction.ID, &record.Transaction.Type, &record.Transaction.Description, &ownerType, &ownerID, &source, &externalID, &record.Transaction.Metadata, &record.Transaction.CreatedAt, &record.Transaction.UpdatedAt)
+	var parentID sql.NullInt64
+	err := db.QueryRowContext(ctx, `SELECT id, transaction_type, description, owner_type, owner_id, parent_transaction_id, external_source, external_id, metadata, created_at, updated_at FROM ledger_transactions WHERE id = $1`, id).
+		Scan(&record.Transaction.ID, &record.Transaction.Type, &record.Transaction.Description, &ownerType, &ownerID, &parentID, &source, &externalID, &record.Transaction.Metadata, &record.Transaction.CreatedAt, &record.Transaction.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return record, fmt.Errorf("%w: %d", domain.ErrTransactionNotFound, id)
 	}
@@ -174,6 +176,9 @@ func (LedgerRepository) GetTransaction(ctx context.Context, db queryExecutor, id
 	}
 	if ownerID.Valid {
 		record.Transaction.Owner = &domain.OwnerRef{Type: ownerType.String, ID: ownerID.Int64}
+	}
+	if parentID.Valid {
+		record.Transaction.ParentTransactionID = &parentID.Int64
 	}
 	record.Transaction.IdempotencyKey = domain.IdempotencyKey{Source: source.String, ID: externalID.String}
 	rows, err := db.QueryContext(ctx, `SELECT id, account_id, transaction_id, entry_type, amount, metadata, created_at, updated_at FROM ledger_entries WHERE transaction_id = $1 ORDER BY id`, id)
@@ -197,7 +202,7 @@ type PageCursor struct {
 }
 
 func (LedgerRepository) ListTransactions(ctx context.Context, db queryExecutor, ownerID int64, limit int, cursor *PageCursor) ([]domain.Transaction, error) {
-	query := `SELECT id, transaction_type, description, owner_type, owner_id, external_source, external_id, metadata, created_at, updated_at FROM ledger_transactions WHERE owner_id = $1`
+	query := `SELECT id, transaction_type, description, owner_type, owner_id, parent_transaction_id, external_source, external_id, metadata, created_at, updated_at FROM ledger_transactions WHERE owner_id = $1`
 	args := []any{ownerID}
 	if cursor != nil {
 		query += ` AND (created_at, id) < ($2, $3)`
@@ -214,13 +219,16 @@ func (LedgerRepository) ListTransactions(ctx context.Context, db queryExecutor, 
 	for rows.Next() {
 		var item domain.Transaction
 		var typ sql.NullString
-		var oid sql.NullInt64
+		var oid, parentID sql.NullInt64
 		var source, ext sql.NullString
-		if err := rows.Scan(&item.ID, &item.Type, &item.Description, &typ, &oid, &source, &ext, &item.Metadata, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Type, &item.Description, &typ, &oid, &parentID, &source, &ext, &item.Metadata, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if oid.Valid {
 			item.Owner = &domain.OwnerRef{Type: typ.String, ID: oid.Int64}
+		}
+		if parentID.Valid {
+			item.ParentTransactionID = &parentID.Int64
 		}
 		item.IdempotencyKey = domain.IdempotencyKey{Source: source.String, ID: ext.String}
 		items = append(items, item)

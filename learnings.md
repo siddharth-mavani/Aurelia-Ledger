@@ -987,6 +987,64 @@ the same accounts in opposite input order, both still request locks in the same
 order. This avoids the classic deadlock pattern where each transaction holds
 one account while waiting for the other.
 
+### Why deterministic account ordering prevents a deadlock
+
+A **deadlock** is a circular wait. It is not merely one request waiting for
+another. For example, imagine two transactions that both need to change these
+two accounts:
+
+~~~text
+source:stripe
+wallet:42
+~~~
+
+Without one shared ordering rule, the client-provided posting order could make
+the transactions take their locks in opposite directions:
+
+~~~text
+Transaction A                         Transaction B
+-------------                         -------------
+locks wallet:42
+                                      locks source:stripe
+tries to lock source:stripe; waits    tries to lock wallet:42; waits
+~~~
+
+A is waiting for B, while B is waiting for A. Neither transaction can reach
+`COMMIT` and release its first lock. PostgreSQL detects this circular wait and
+aborts one transaction with a deadlock error; that preserves database
+correctness, but the rejected request must fail or be safely retried.
+
+The existing implementation removes that circle by making the repository,
+not the caller, choose the order. `LockExistingAccounts` in
+`internal/database/postgres/ledger_repository.go` first deduplicates the
+account codes, calls `sort.Strings(codes)`, and then executes one
+`SELECT ... FOR UPDATE` per sorted code. Therefore both transactions above
+must lock `source:stripe` before `wallet:42`, regardless of the order in which
+the API client supplied their postings:
+
+~~~text
+Transaction A                         Transaction B
+-------------                         -------------
+locks source:stripe
+                                      waits for source:stripe
+locks wallet:42
+COMMIT; releases both locks
+                                      locks source:stripe
+                                      locks wallet:42
+                                      COMMIT
+~~~
+
+B still waits, but it holds no later account while waiting for the earlier
+one. That is a queue, not a circle, so these account locks cannot deadlock
+with each other. "Ascending" is not magic: descending order or sorted account
+IDs would also work. The important rule is that **every path which locks the
+same set of accounts uses exactly the same stable order**.
+
+This is limited to the account locks handled by `LockExistingAccounts`. A
+future workflow that locks additional resources (for example, a reservation
+row) must define and follow a compatible order for those resources too;
+otherwise it could introduce a new lock cycle.
+
 ## Foreign keys: existence versus semantic correctness
 
 An FK from `ledger_transactions.owner_id` to `ledger_owners.id` proves only
@@ -1146,3 +1204,311 @@ applies migrations twice to prove idempotency, then tests:
 The tests run only when `TOKEN_LEDGER_TEST_DATABASE_URL` points to disposable
 PostgreSQL. This is intentional: they drop/recreate tables and must never run
 against valuable data.
+
+## Phase 3: reservations, capture, and release
+
+Phase 3 adds a **reservation lifecycle**. A reservation temporarily removes
+tokens from an owner's spendable balance without yet treating them as consumed.
+It has three operations:
+
+~~~text
+reserve  -> move available tokens into a held/reserved account
+capture  -> consume some held tokens after work succeeds
+release  -> return unused held tokens to the available account
+~~~
+
+For owner `42`, the implementation uses two owner-owned accounts:
+
+~~~text
+wallet:42              available tokens
+wallet:42:reserved     tokens held for an in-progress operation
+~~~
+
+The exact `wallet:<ownerID>:reserved` convention is important. It keeps the
+reserved account visibly tied to its owner and lets validation reject a caller
+attempting to post to another owner's wallet, for example
+`wallet:99:reserved` while acting for owner `42`.
+
+### The accounting movements
+
+TokenLedger defines an account balance as:
+
+~~~text
+balance = sum(debits) - sum(credits)
+~~~
+
+Assume owner 42 has 100 available tokens and reserves 80:
+
+~~~text
+reserve 80
+------------
+credit wallet:42               80    available: 100 -> 20
+debit  wallet:42:reserved      80    reserved:    0 -> 80
+~~~
+
+The owner's total represented tokens are still 100, but only 20 are currently
+available for ordinary `Spend` operations. The reservation posting sets
+`EnforcePositive: true` on the available-wallet credit, so a user cannot
+reserve more tokens than are available.
+
+If an external operation successfully uses 30 of the reservation, capture
+writes another balanced journal transaction:
+
+~~~text
+capture 30
+------------
+credit wallet:42:reserved      30    reserved: 80 -> 50
+debit  sink:consumed           30
+~~~
+
+`sink:consumed` is a system-owned account created by the Phase 3 migration.
+It is deliberately separate from `sink:spend`, which records direct spend
+operations. Separating them lets reporting distinguish immediate spends from
+amounts consumed after a reservation.
+
+If the remaining 50 is no longer needed, release writes:
+
+~~~text
+release 50
+------------
+credit wallet:42:reserved      50    reserved: 50 -> 0
+debit  wallet:42               50    available: 20 -> 70
+~~~
+
+The completed reservation therefore has `captured=30`, `released=50`, and
+`original=80`.
+
+### Reservation projection versus journal history
+
+The journal header and entry rows remain immutable. Phase 3 adds the mutable
+`ledger_reservations` projection, one row for each reserve transaction. It
+stores:
+
+~~~text
+reservation_transaction_id
+owner_id
+original_amount
+captured_amount
+released_amount
+status: open or settled
+~~~
+
+The database checks enforce:
+
+~~~text
+captured_amount >= 0
+released_amount >= 0
+captured_amount + released_amount <= original_amount
+status is settled exactly when captured_amount + released_amount = original_amount
+~~~
+
+For example, a second capture of 60 after a first capture of 60 from an
+original reservation of 100 must fail: it would attempt to settle 120 tokens.
+The service rejects it with `ErrReservationOverSettled`, and the database
+constraint provides an additional backstop against invalid persisted state.
+
+`reservation_transaction_id` is both the projection's primary key and a
+foreign key to the original reserve transaction. Capture and release journal
+headers also store that reserve transaction as their `parent_transaction_id`.
+This creates a traceable chain:
+
+~~~text
+reserve transaction #100
+  ├─ capture transaction #101
+  └─ release transaction #102
+~~~
+
+`ON DELETE RESTRICT` prevents removal of a referenced owner or journal header.
+This is appropriate for financial-like history: correct mistakes with a new
+reversal or adjustment rather than deleting the original event.
+
+### Required capture amount; optional release amount
+
+`SettlementCommand.Amount` is a pointer:
+
+~~~go
+Amount *domain.Amount
+~~~
+
+The pointer lets Go distinguish omitted JSON from an explicit numeric value.
+
+~~~text
+nil                 field was omitted
+&Amount(0)          caller supplied zero
+&Amount(30)         caller supplied 30
+~~~
+
+Capture requires a supplied positive amount. This makes the amount consumed
+explicit and prevents an accidental full capture:
+
+~~~json
+POST /v1/reservations/100/capture
+{"amount":30,"metadata":{}}
+~~~
+
+An omitted capture amount returns `400 validation_error`.
+
+Release accepts an omitted amount. It means **release the complete remaining
+held amount**, not the amount already captured. With original 80 and captured
+30, this request releases 50:
+
+~~~json
+POST /v1/reservations/100/release
+{}
+~~~
+
+After a reservation is fully settled, further capture or release requests fail
+instead of silently creating extra accounting entries.
+
+### Transaction boundaries and concurrent settlement
+
+Capture and release first execute:
+
+~~~sql
+SELECT ... FROM ledger_reservations
+WHERE reservation_transaction_id = $1
+FOR UPDATE;
+~~~
+
+`FOR UPDATE` takes a PostgreSQL row lock until the transaction commits or
+rolls back. This serializes competing settlement attempts for one reservation.
+
+~~~text
+Reservation original amount: 100
+
+Request A wants to capture 60
+Request B wants to capture 60
+
+A locks the reservation, captures 60, and commits.
+B waits for A's lock, then sees only 40 remaining and fails.
+~~~
+
+The service then locks involved accounts through the existing canonical
+ascending-account-code path. It always locks the available wallet even for a
+capture, which does not directly post to it, because the cached available
+balance is updated in that same transaction. Locking it avoids stale cached
+balance writes racing with a spend, reserve, or release.
+
+### Public HTTP operations and their authorization boundary
+
+Reservations are not internal-only. Bearer-authenticated HTTP clients can use:
+
+~~~text
+POST /v1/owners/{ownerID}/reservations
+POST /v1/reservations/{reservationID}/capture
+POST /v1/reservations/{reservationID}/release
+GET  /v1/reservations/{reservationID}
+~~~
+
+For example:
+
+~~~bash
+curl -X POST http://localhost:8080/v1/owners/42/reservations \
+  -H "Authorization: Bearer $TOKENLEDGER_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":80,"description":"provider hold","metadata":{}}'
+~~~
+
+The current API uses one local operator token. It authenticates the caller,
+but it does **not** yet authorize a particular caller to act only for a
+particular owner. Therefore every holder of that token can currently operate
+on every owner ID. A user-facing deployment needs identity and ownership/role
+checks before exposing these routes to untrusted users.
+
+### `SpendWithOperation` is deliberately internal-only
+
+`SpendWithOperation` has no HTTP endpoint. It is a Go method intended for an
+in-process provider adapter:
+
+~~~go
+type ExternalWork interface {
+    Execute(context.Context) error
+}
+~~~
+
+Its sequence is:
+
+~~~text
+1. reserve and commit the local hold
+2. run ExternalWork outside the database transaction
+3. capture the full reservation if ExternalWork succeeds
+4. release the remaining hold if ExternalWork fails
+~~~
+
+The external call must happen outside the SQL transaction. A provider request
+may be slow, may time out, and cannot be rolled back by PostgreSQL. Holding
+database row locks while waiting for a network call would reduce concurrency
+and still would not make the two systems atomic.
+
+If the external call fails and release also fails, `errors.Join(workErr,
+releaseErr)` preserves both errors. The provider error explains why the work
+failed; the release error tells an operator that held funds may need recovery.
+
+The tests use a small function adapter rather than a real provider:
+
+~~~go
+type externalWorkFunc func(context.Context) error
+
+func (f externalWorkFunc) Execute(ctx context.Context) error { return f(ctx) }
+
+success := externalWorkFunc(func(context.Context) error { return nil })
+failure := externalWorkFunc(func(context.Context) error {
+    return errors.New("provider failed")
+})
+~~~
+
+The success case proves that the reservation is captured. The failure case
+proves that the reservation is released and the provider error is returned.
+They test orchestration, not an actual network provider.
+
+### Relationship to real payment systems
+
+Reserve/capture/release is one common form of a wider pattern:
+
+~~~text
+hold or commit local funds
+-> perform checks or external work
+-> finalize, release, reverse, or compensate
+~~~
+
+Card payments often resemble `authorize -> capture -> void/reversal`.
+Marketplace or usage-based systems often resemble this application's
+`reserve -> capture/release` flow. In contrast, an internal transfer between
+two wallets controlled by one database can usually be a single atomic debit
+and credit transaction. A bank transfer normally has more states, such as
+`initiated -> screened -> accepted/rejected -> settled/returned`, because
+multiple banks and payment rails exchange messages independently.
+
+A local reservation means only that *this application's* ledger will not
+spend those funds twice. It is not proof that an external bank, provider, or
+payment rail accepted the operation. Production cross-system payment flows
+also need provider operation IDs, retry-safe idempotency, webhooks or polling,
+expiry handling, reconciliation, and compensating journal entries. A
+transactional outbox is useful when the application promises reliable
+delivery of downstream events, but it is intentionally not part of this Phase
+3 implementation.
+
+### Phase 3 test coverage and execution boundary
+
+The opt-in PostgreSQL integration tests now cover:
+
+~~~text
+- reserved-account creation with wallet:<ownerID>:reserved
+- insufficient funds after a reservation
+- required capture amount
+- partial capture and default release of the remaining hold
+- readback of reservation state and rejection after settlement
+- release followed by capture
+- concurrent capture attempts against the same reservation
+- SpendWithOperation success and callback-failure release
+- public reserve/capture/release/get HTTP routes and validation errors
+~~~
+
+The suite remains opt-in because it drops and recreates database tables:
+
+~~~bash
+TOKEN_LEDGER_TEST_DATABASE_URL='postgres://.../disposable_db' \
+  GOCACHE=/private/tmp/tokenledger_gocache go test ./tests/integration -v
+~~~
+
+Never point this variable at a database containing valuable data.
