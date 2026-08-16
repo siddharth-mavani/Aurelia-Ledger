@@ -1,8 +1,8 @@
-# TokenLedger application implementation plan
+# Aurelia Ledger application implementation plan
 
 ## Architecture and conventions
 
-TokenLedger is a locally runnable HTTP application backed by PostgreSQL. The server starts in `cmd/server`; domain rules live in `internal/domain`; database access and SQL transaction boundaries live in `internal/database/postgres`; HTTP code belongs in `internal/httpapi`; application workflows belong in `internal/ledger`.
+Aurelia Ledger is a locally runnable HTTP application backed by PostgreSQL. The server starts in `cmd/server`; domain rules live in `internal/domain`; database access and SQL transaction boundaries live in `internal/database/postgres`; HTTP code belongs in `internal/httpapi`; application workflows belong in `internal/ledger`.
 
 All tests live below `tests/`: deterministic unit tests in `tests/domain` and disposable-PostgreSQL API/database tests in `tests/integration`. PostgreSQL is the only runtime database. Amounts are positive `int64` token base units. Account balance is `sum(debits) - sum(credits)`. Journal headers and entries are append-only; account/owner balances are mutable projections updated in the same transaction as their postings.
 
@@ -22,17 +22,17 @@ All tests live below `tests/`: deterministic unit tests in `tests/domain` and di
 ### Validation and local execution
 
 ```bash
-cd /Users/smavani/dev/token-ledger
-GOCACHE=/private/tmp/tokenledger_gocache go test ./...
-GOCACHE=/private/tmp/tokenledger_gocache go test -race ./...
-GOCACHE=/private/tmp/tokenledger_gocache go vet ./...
+cd /Users/smavani/dev/Aurelia-Ledger
+GOCACHE=/private/tmp/aurelia_ledger_gocache go test ./...
+GOCACHE=/private/tmp/aurelia_ledger_gocache go test -race ./...
+GOCACHE=/private/tmp/aurelia_ledger_gocache go vet ./...
 
 DATABASE_URL="$DATABASE_URL" go run ./cmd/migrate up
 DATABASE_URL="$DATABASE_URL" go run ./cmd/server
 curl http://localhost:8080/healthz
 ```
 
-Set `TOKEN_LEDGER_TEST_DATABASE_URL` to a disposable PostgreSQL database to execute the opt-in schema integration tests.
+Set `AURELIA_LEDGER_TEST_DATABASE_URL` to a disposable PostgreSQL database to execute the opt-in schema integration tests.
 
 ### Migration policy
 
@@ -60,7 +60,7 @@ Set `TOKEN_LEDGER_TEST_DATABASE_URL` to a disposable PostgreSQL database to exec
 
 ### HTTP API
 
-Add `internal/httpapi` for routing, JSON decoding, request IDs, validation, and stable JSON errors. Require `Authorization: Bearer <token>` for `/v1/*`; load the local operator token only from `TOKENLEDGER_API_TOKEN` and never log it.
+Add `internal/httpapi` for routing, JSON decoding, request IDs, validation, and stable JSON errors. Require `Authorization: Bearer <token>` for `/v1/*`; load the local operator token only from `AURELIA_LEDGER_API_TOKEN` and never log it.
 
 ```text
 POST /v1/owners
@@ -90,7 +90,7 @@ Deposit and spend requests accept `{"amount":100,"description":"Token purchase",
 
 Adjustment requests accept `{"description":"Manual correction","external_source":"admin","external_id":"adj_1","metadata":{},"postings":[{"account_code":"wallet:1","account_name":"Customer 1 Wallet","side":"debit","amount":10,"metadata":{}},{"account_code":"source:stripe","account_name":"Stripe Source","side":"credit","amount":10,"metadata":{}}]}` and return the same transaction result. Every referenced system account must already be registered. Balance returns `{"owner_id":1,"available_balance":100}`. Transaction reads return headers with entries ordered by entry ID. List requests accept `limit` (default 50, max 100) and an opaque base64 cursor encoding `(created_at,id)`; responses are `{"items":[...],"next_cursor":"..."}`. Invalid/malformed cursors return `400 validation_error`.
 
-The server must refuse startup if `TOKENLEDGER_API_TOKEN` is empty. `/healthz` is intentionally public. `/v1/*` compares bearer tokens using `crypto/subtle.ConstantTimeCompare`; token rotation requires process restart in this initial release.
+The server must refuse startup if `AURELIA_LEDGER_API_TOKEN` is empty. `/healthz` is intentionally public. `/v1/*` compares bearer tokens using `crypto/subtle.ConstantTimeCompare`; token rotation requires process restart in this initial release.
 
 `POST /v1/owners/{ownerID}/reconcile` recomputes the wallet account from entries, writes that result to both `ledger_accounts.current_balance` and `ledger_owners.cached_balance` in one transaction, logs the old/new values, and returns `{"owner_id":1,"previous_available_balance":90,"available_balance":100,"repaired":true}`. It creates no journal entry because it repairs projections only.
 

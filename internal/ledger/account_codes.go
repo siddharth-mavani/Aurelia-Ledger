@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"tokenledger/internal/domain"
+	"aurelialedger/internal/domain"
 )
 
 var sourceNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)

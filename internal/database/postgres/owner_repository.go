@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"tokenledger/internal/domain"
+	"aurelialedger/internal/domain"
 )
 
 // OwnerRepository persists owners. Writes intentionally require the caller's

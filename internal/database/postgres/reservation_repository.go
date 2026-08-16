@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"tokenledger/internal/domain"
+	"aurelialedger/internal/domain"
 )
 
 // Reservation is the mutable settlement projection for one reserve journal transaction.

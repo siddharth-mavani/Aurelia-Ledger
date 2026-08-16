@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"tokenledger/internal/domain"
+	"aurelialedger/internal/domain"
 )
 
 // LedgerRepository contains persistence operations for accounts and journal rows.

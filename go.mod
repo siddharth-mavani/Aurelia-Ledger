@@ -1,4 +1,4 @@
-module tokenledger
+module aurelialedger
 
 go 1.26.0
 

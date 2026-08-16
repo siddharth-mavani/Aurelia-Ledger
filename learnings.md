@@ -1,12 +1,12 @@
-# TokenLedger learning guide
+# Aurelia Ledger learning guide
 
-This guide explains the current TokenLedger implementation for somebody new to
+This guide explains the current Aurelia Ledger implementation for somebody new to
 Go, HTTP applications, and PostgreSQL. It covers the code that exists today,
 not only the features planned for later phases.
 
 ## What the application does now
 
-TokenLedger is an HTTP application with a PostgreSQL-backed token ledger. It
+Aurelia Ledger is an HTTP application with a PostgreSQL-backed token ledger. It
 can create owners, register trusted deposit sources, record deposits, spends,
 and adjustments, read balances/history, and reconcile cached projections.
 
@@ -69,13 +69,13 @@ HTTP request -> authentication -> domain/service validation -> SQL transaction
 go.mod contains:
 
 ~~~go
-module tokenledger
+module aurelialedger
 ~~~
 
 That is the import prefix for this repository:
 
 ~~~go
-import "tokenledger/internal/config"
+import "aurelialedger/internal/config"
 ~~~
 
 A package is a group of Go files in one directory using the same package name.
@@ -117,7 +117,7 @@ ListenAddr:  os.Getenv("LISTEN_ADDR"),
 DATABASE_URL is required. LISTEN_ADDR is optional and defaults to :8080.
 
 ~~~text
-postgres://postgres:postgres@localhost:5432/tokenledger?sslmode=disable
+postgres://postgres:postgres@localhost:5432/aurelia_ledger?sslmode=disable
            username password host      port  database name
 ~~~
 
@@ -371,7 +371,7 @@ However, it only executes one file. It does not remember that the file ran, so
 running it again usually fails because tables already exist. It also does not
 choose and run later files in order.
 
-TokenLedger is planned to have several forward-only migrations plus other Go
+Aurelia Ledger is planned to have several forward-only migrations plus other Go
 operational commands (`cmd/reconcile` and `cmd/import`). Therefore it uses one
 small Go command instead:
 
@@ -510,7 +510,7 @@ The opt-in PostgreSQL integration test now exercises the real migration code:
 It only runs with a disposable database because it drops tables:
 
 ~~~bash
-TOKEN_LEDGER_TEST_DATABASE_URL="$DATABASE_URL" go test ./tests/integration/...
+AURELIA_LEDGER_TEST_DATABASE_URL="$DATABASE_URL" go test ./tests/integration/...
 ~~~
 
 Never point that variable at a database containing data you need to keep.
@@ -754,13 +754,13 @@ go test -race ./...
 If the default Go cache is unavailable in a restricted environment:
 
 ~~~bash
-GOCACHE=/private/tmp/token-ledger_gocache go test ./...
+GOCACHE=/private/tmp/aurelia_ledger_gocache go test ./...
 ~~~
 
 The domain tests need no database. The integration test is opt-in:
 
 ~~~bash
-TOKEN_LEDGER_TEST_DATABASE_URL="$DATABASE_URL" go test ./tests/integration/...
+AURELIA_LEDGER_TEST_DATABASE_URL="$DATABASE_URL" go test ./tests/integration/...
 ~~~
 
 It drops/recreates tables and functions, so its URL must point to an empty,
@@ -769,17 +769,17 @@ disposable database. Never point it at important data.
 Start local PostgreSQL:
 
 ~~~bash
-docker run --rm --name token-ledger-postgres \
+docker run --rm --name aurelia-ledger-postgres \
   -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=tokenledger \
+  -e POSTGRES_DB=aurelia_ledger \
   -p 5432:5432 postgres:16
 ~~~
 
 Then, in another terminal:
 
 ~~~bash
-cd /Users/smavani/dev/token-ledger
-export DATABASE_URL='postgres://postgres:postgres@localhost:5432/tokenledger?sslmode=disable'
+cd /Users/smavani/dev/Aurelia-Ledger
+export DATABASE_URL='postgres://postgres:postgres@localhost:5432/aurelia_ledger?sslmode=disable'
 go run ./cmd/migrate up
 go run ./cmd/server
 curl http://localhost:8080/healthz
@@ -1133,10 +1133,10 @@ JSON for transport; Base64 is not encryption.
 `/healthz` is public. Every `/v1/*` route requires:
 
 ~~~text
-Authorization: Bearer <TOKENLEDGER_API_TOKEN>
+Authorization: Bearer <AURELIA_LEDGER_API_TOKEN>
 ~~~
 
-The server refuses to start without `TOKENLEDGER_API_TOKEN`. The migration
+The server refuses to start without `AURELIA_LEDGER_API_TOKEN`. The migration
 command does not require it, because schema migration is not HTTP service
 operation. Token comparison uses `crypto/subtle.ConstantTimeCompare`, avoiding
 early-exit byte comparisons that can leak prefix information through timing.
@@ -1201,7 +1201,7 @@ applies migrations twice to prove idempotency, then tests:
 - every authenticated HTTP endpoint and auth failure
 ~~~
 
-The tests run only when `TOKEN_LEDGER_TEST_DATABASE_URL` points to disposable
+The tests run only when `AURELIA_LEDGER_TEST_DATABASE_URL` points to disposable
 PostgreSQL. This is intentional: they drop/recreate tables and must never run
 against valuable data.
 
@@ -1231,7 +1231,7 @@ attempting to post to another owner's wallet, for example
 
 ### The accounting movements
 
-TokenLedger defines an account balance as:
+Aurelia Ledger defines an account balance as:
 
 ~~~text
 balance = sum(debits) - sum(credits)
@@ -1404,7 +1404,7 @@ For example:
 
 ~~~bash
 curl -X POST http://localhost:8080/v1/owners/42/reservations \
-  -H "Authorization: Bearer $TOKENLEDGER_API_TOKEN" \
+  -H "Authorization: Bearer $AURELIA_LEDGER_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"amount":80,"description":"provider hold","metadata":{}}'
 ~~~
@@ -1507,8 +1507,8 @@ The opt-in PostgreSQL integration tests now cover:
 The suite remains opt-in because it drops and recreates database tables:
 
 ~~~bash
-TOKEN_LEDGER_TEST_DATABASE_URL='postgres://.../disposable_db' \
-  GOCACHE=/private/tmp/tokenledger_gocache go test ./tests/integration -v
+AURELIA_LEDGER_TEST_DATABASE_URL='postgres://.../disposable_db' \
+  GOCACHE=/private/tmp/aurelia_ledger_gocache go test ./tests/integration -v
 ~~~
 
 Never point this variable at a database containing valuable data.

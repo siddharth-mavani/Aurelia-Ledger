@@ -15,10 +15,10 @@ import (
 	"sync"
 	"testing"
 
-	"tokenledger/internal/database/postgres"
-	"tokenledger/internal/domain"
-	"tokenledger/internal/httpapi"
-	"tokenledger/internal/ledger"
+	"aurelialedger/internal/database/postgres"
+	"aurelialedger/internal/domain"
+	"aurelialedger/internal/httpapi"
+	"aurelialedger/internal/ledger"
 )
 
 type externalWorkFunc func(context.Context) error
@@ -28,9 +28,9 @@ func (f externalWorkFunc) Execute(ctx context.Context) error { return f(ctx) }
 // Integration tests are intentionally opt-in until a PostgreSQL test database is supplied.
 // DATABASE_URL must point to an empty, disposable PostgreSQL database.
 func TestPostgresConnection(t *testing.T) {
-	url := os.Getenv("TOKEN_LEDGER_TEST_DATABASE_URL")
+	url := os.Getenv("AURELIA_LEDGER_TEST_DATABASE_URL")
 	if url == "" {
-		t.Skip("set TOKEN_LEDGER_TEST_DATABASE_URL to run PostgreSQL integration tests")
+		t.Skip("set AURELIA_LEDGER_TEST_DATABASE_URL to run PostgreSQL integration tests")
 	}
 	store, err := postgres.Open(context.Background(), url)
 	if err != nil {

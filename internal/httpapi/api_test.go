@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"tokenledger/internal/database/postgres"
+	"aurelialedger/internal/database/postgres"
 )
 
 func TestPublicHealthAndAuthentication(t *testing.T) {

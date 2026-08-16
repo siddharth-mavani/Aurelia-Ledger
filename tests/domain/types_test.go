@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"tokenledger/internal/domain"
+	"aurelialedger/internal/domain"
 )
 
 func validPostings() []domain.Posting {

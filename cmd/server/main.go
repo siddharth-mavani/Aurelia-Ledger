@@ -1,4 +1,4 @@
-// Command server runs the TokenLedger HTTP application.
+// Command server runs the Aurelia Ledger HTTP application.
 package main
 
 import (
@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"tokenledger/internal/config"
-	"tokenledger/internal/database/postgres"
-	"tokenledger/internal/httpapi"
-	"tokenledger/internal/ledger"
+	"aurelialedger/internal/config"
+	"aurelialedger/internal/database/postgres"
+	"aurelialedger/internal/httpapi"
+	"aurelialedger/internal/ledger"
 )
 
 func main() {
@@ -25,7 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 	if config.APIToken == "" {
-		logger.Error("invalid configuration", "error", "TOKENLEDGER_API_TOKEN is required")
+		logger.Error("invalid configuration", "error", "AURELIA_LEDGER_API_TOKEN is required")
 		os.Exit(1)
 	}
 

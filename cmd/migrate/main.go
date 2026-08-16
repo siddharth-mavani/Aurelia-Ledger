@@ -1,4 +1,4 @@
-// Command migrate applies TokenLedger PostgreSQL schema migrations.
+// Command migrate applies Aurelia Ledger PostgreSQL schema migrations.
 package main
 
 import (
@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"tokenledger/internal/config"
-	"tokenledger/internal/database/postgres"
+	"aurelialedger/internal/config"
+	"aurelialedger/internal/database/postgres"
 )
 
 func main() {

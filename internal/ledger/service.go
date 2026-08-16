@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 
-	"tokenledger/internal/database/postgres"
-	"tokenledger/internal/domain"
+	"aurelialedger/internal/database/postgres"
+	"aurelialedger/internal/domain"
 )
 
 // Service coordinates repositories inside the transaction boundaries required

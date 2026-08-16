@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"tokenledger/internal/domain"
+	"aurelialedger/internal/domain"
 )
 
 func TestOwnerValidation(t *testing.T) {

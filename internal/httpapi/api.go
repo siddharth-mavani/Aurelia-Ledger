@@ -1,4 +1,4 @@
-// Package httpapi exposes the Phase 2 TokenLedger HTTP API.
+// Package httpapi exposes the Aurelia Ledger HTTP API.
 package httpapi
 
 import (
@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"tokenledger/internal/database/postgres"
-	"tokenledger/internal/domain"
-	"tokenledger/internal/ledger"
+	"aurelialedger/internal/database/postgres"
+	"aurelialedger/internal/domain"
+	"aurelialedger/internal/ledger"
 )
 
 type API struct {
